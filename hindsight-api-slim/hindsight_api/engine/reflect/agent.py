@@ -35,6 +35,7 @@ from .prompts import (
     _extract_directive_rules,
     build_agent_user_prompt,
     build_chunk_claims_prompt,
+    build_done_request_prompt,
     build_final_prompt,
     build_final_system_prompt,
     build_reduce_prompt,
@@ -857,6 +858,56 @@ async def _run_reflect_agent_inner(
         )
         return response.strip()
 
+    async def _ask_for_done() -> "LLMToolCall | None":
+        """Ask for the answer as a ``done`` call, in the conversation it was gathered in.
+
+        The model stopping with prose is the common case (measured: only ~29% of
+        refreshes ever call ``done`` on their own), and it costs twice. The prose
+        is dropped — it can be a raw done payload with ids leaking into
+        user-visible text — and the standalone synthesis prompt then re-renders
+        every tool result into a NEW prompt, so the whole evidence set is billed
+        again at the full input rate. Asking here reuses the prefix the provider
+        already has, and comes back as the structured document a page wants
+        instead of markdown that has to be split back apart.
+
+        Returns None when the provider will not produce the call, and the caller
+        falls back to the standalone prompt.
+        """
+        nonlocal total_input_tokens, total_output_tokens, total_cached_tokens, total_thoughts_tokens
+        if not messages or messages[-1].get("role") != "tool":
+            return None
+        llm_start = time.time()
+        try:
+            result = await llm_config.call_with_tools(
+                messages=[
+                    *messages,
+                    {"role": "user", "content": build_done_request_prompt(query, max_tokens, llm_output_language)},
+                ],
+                tools=tools,
+                scope="reflect",
+                tool_choice=LLMToolChoice.named("done"),
+                temperature=get_config().llm_temperature_reflect,
+                max_completion_tokens=synthesis_max_completion_tokens,
+            )
+        except OperationCancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[REFLECT {reflect_id}] closing done call failed, using the standalone prompt: {e}")
+            return None
+        total_input_tokens += result.input_tokens
+        total_output_tokens += result.output_tokens
+        total_cached_tokens += getattr(result, "cached_tokens", 0) or 0
+        total_thoughts_tokens += getattr(result, "thoughts_tokens", 0) or 0
+        llm_trace.append(
+            {
+                "scope": "final",
+                "duration_ms": int((time.time() - llm_start) * 1000),
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+            }
+        )
+        return next((tc for tc in result.tool_calls if _is_done_tool(tc.name)), None)
+
     async def _forced_final_synthesis(iterations_completed: int) -> ReflectAgentResult:
         """Answer without tools from the accumulated tool results.
 
@@ -994,7 +1045,28 @@ async def _run_reflect_agent_inner(
         is_last = iteration == max_iterations - 1
 
         if is_last:
-            # Force text response on last iteration - no tools
+            # Out of iterations. Same as the stop-with-prose case below: ask for the
+            # answer through ``done`` in this conversation before falling back to
+            # the standalone synthesis prompt, which re-sends all the evidence.
+            closing = await _ask_for_done()
+            if closing is not None:
+                return await _process_done_tool(
+                    closing.model_copy(update={"arguments": presenter.resolve(closing.arguments)}),
+                    available_memory_ids,
+                    available_mental_model_ids,
+                    available_observation_ids,
+                    iteration + 1,
+                    total_tools_called,
+                    tool_trace,
+                    _get_llm_trace(),
+                    _get_usage(),
+                    _log_completion,
+                    reflect_id,
+                    directives_applied=directives_applied,
+                    llm_config=llm_config,
+                    response_schema=response_schema,
+                    max_tokens=max_tokens,
+                )
             return await _forced_final_synthesis(iteration + 1)
 
         # Proactive context-window guard: if accumulated messages would exceed the
@@ -1152,8 +1224,29 @@ async def _run_reflect_agent_inner(
                     f"Reflect requires a tool-calling model, but {llm_config.provider}/{llm_config.model} "
                     f"produced no usable tool call (the transport may not support function calling)." + detail
                 )
-            # Model tool-called earlier and is now stopping: fall through to a clean
-            # forced final synthesis (tools disabled, prose expected).
+            # Model tool-called earlier and is now stopping. Ask it to say the same
+            # thing through ``done`` first — same conversation, so the evidence is
+            # not re-sent, and the answer arrives structured. Falls back to the
+            # standalone synthesis prompt when the provider will not produce it.
+            closing = await _ask_for_done()
+            if closing is not None:
+                return await _process_done_tool(
+                    closing.model_copy(update={"arguments": presenter.resolve(closing.arguments)}),
+                    available_memory_ids,
+                    available_mental_model_ids,
+                    available_observation_ids,
+                    iteration + 1,
+                    total_tools_called,
+                    tool_trace,
+                    _get_llm_trace(),
+                    _get_usage(),
+                    _log_completion,
+                    reflect_id,
+                    directives_applied=directives_applied,
+                    llm_config=llm_config,
+                    response_schema=response_schema,
+                    max_tokens=max_tokens,
+                )
             return await _forced_final_synthesis(iteration + 1)
 
         # The model produced at least one tool call reflect could parse: it can
@@ -1380,7 +1473,6 @@ async def _run_reflect_agent_inner(
                     for obs in output["observations"]:
                         if "id" in obs:
                             available_observation_ids.add(obs["id"])
-
                 if normalized_tool_name == "recall" and isinstance(output, dict) and "memories" in output:
                     for memory in output["memories"]:
                         if "id" in memory:

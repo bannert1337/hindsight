@@ -556,15 +556,20 @@ def summary_table(refreshes: list[RefreshCost], price: Price | None = None, expl
 def page_trigger(mode: str = "delta") -> dict[str, Any]:
     """The trigger a coding agent's page carries, minus automatic refresh.
 
-    ``delta`` and sibling-page exclusion are the server's page defaults, stated
-    here so a change to those defaults cannot silently change what this measures.
-    Automatic refresh is off: the eval triggers every refresh itself, and a
-    refresh nobody asked for would land in the measurement window.
+    Sibling mental models are NOT excluded: they are the top layer of reflect's
+    retrieval and the one whose payload has no token budget at all, so a cost
+    measurement that hides them measures the cheap half of the loop. (The
+    server's page default does exclude them; this is deliberately the broader
+    scenario.) Automatic refresh is off: the eval triggers every refresh itself,
+    and a refresh nobody asked for would land in the measurement window.
     """
     return {
         "mode": mode,
         "fact_types": ["world", "experience", "observation"],
-        "exclude_mental_models": True,
+        # The server's page default (exclude siblings) is the other scenario worth
+        # measuring, because it is where the forced descent to raw recall has
+        # nothing above it to release the loop first.
+        "exclude_mental_models": os.getenv("HINDSIGHT_EVAL_REFRESH_COST_EXCLUDE_MENTAL_MODELS", "").lower() == "true",
         "refresh_after_consolidation": False,
     }
 

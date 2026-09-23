@@ -834,6 +834,31 @@ def build_final_prompt(
     return "\n".join(parts) + output_language_directive(llm_output_language)
 
 
+def build_done_request_prompt(
+    query: str,
+    max_tokens: int | None = None,
+    llm_output_language: str | None = None,
+) -> str:
+    """The closing user turn that asks for the answer as a ``done`` call.
+
+    Sent inside the tool-loop conversation, so it carries only what the answer
+    needs beyond the evidence already there: stop retrieving, the question, the
+    instructions and the length target.
+    """
+    parts = [
+        "## Answer now",
+        "Stop retrieving. Call the `done` tool with your final answer, built from the tool results above.",
+        "This is the ANSWER, not a summary of it: carry over every relevant fact, date and number from the "
+        "tool results, at the same depth you would write for a reader who cannot see them.",
+        f"\n## Question\n{query}",
+        "\n## Instructions\n" + _FINAL_INSTRUCTIONS,
+    ]
+    length_directive = _length_directive(max_tokens)
+    if length_directive is not None:
+        parts.append(length_directive)
+    return "\n".join(parts) + output_language_directive(llm_output_language)
+
+
 #: System prompt for the intermediate (map) calls of split synthesis. They do
 #: NOT answer the question — they compress one chunk of retrieved data into
 #: dated, cited claims that the reduce call can reason over. Dates and ids are
