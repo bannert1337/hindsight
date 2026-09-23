@@ -616,8 +616,10 @@ def _render_history_block(entry: dict) -> str:
     """Render one context-history entry as a fenced JSON block."""
     tool = entry["tool"]
     output = entry["output"]
+    # Compact, like the tool messages the loop sends: indentation was 7% of the
+    # synthesis prompt and tells the model nothing.
     try:
-        output_str = json.dumps(output, indent=2, default=str, ensure_ascii=False)
+        output_str = json.dumps(output, default=str, ensure_ascii=False)
     except (TypeError, ValueError):
         output_str = str(output)
     return f"\n### From {tool}:\n```json\n{output_str}\n```"

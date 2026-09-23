@@ -1871,10 +1871,14 @@ DEFAULT_CONSOLIDATION_WALL_TIMEOUT = 7200  # seconds (2 hours)
 
 # Reflect agent settings
 DEFAULT_REFLECT_MAX_ITERATIONS = 10  # Max tool call iterations before forcing response
-# Step-by-step context caching for the reflect tool loop (Gemini). On by default;
-# requires the global prompt cache (HINDSIGHT_API_LLM_PROMPT_CACHE_ENABLED) to also
-# be on. Set false to force reflect to run uncached even when prompt caching is on.
-DEFAULT_REFLECT_PROMPT_CACHE_ENABLED = True
+# Step-by-step context caching for the reflect tool loop (Gemini). Off by default:
+# Gemini bills an explicit cache's CREATION at the full input rate, plus storage per
+# token-hour, and each rolling cache is read by exactly one call — so every cached
+# token is paid in full once anyway, and the read discount never covers the storage.
+# Measured on the refresh-cost eval: create + storage + reads came to ~18% MORE than
+# sending the same tokens uncached. Gemini's implicit caching still applies with no
+# create or storage fee. Requires HINDSIGHT_API_LLM_PROMPT_CACHE_ENABLED when enabled.
+DEFAULT_REFLECT_PROMPT_CACHE_ENABLED = False
 DEFAULT_REFLECT_MAX_CONTEXT_TOKENS = 100_000  # Max accumulated context tokens before forcing final prompt
 DEFAULT_REFLECT_WALL_TIMEOUT = 300  # Wall-clock timeout in seconds for the entire reflect operation (5 minutes)
 DEFAULT_REFLECT_SOURCE_FACTS_MAX_TOKENS = -1  # Token budget for source facts in search_observations (-1 = disabled)

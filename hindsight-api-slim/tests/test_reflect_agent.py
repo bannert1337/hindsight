@@ -2054,7 +2054,20 @@ class TestReflectIncrementalCache:
     turn's full input, and every per-reflect cache is deleted at the end."""
 
     @pytest.mark.asyncio
-    async def test_each_auto_turn_reuses_previous_step_cache_and_cleans_up(self):
+    async def test_each_auto_turn_reuses_previous_step_cache_and_cleans_up(self, monkeypatch):
+        # Off by default (every rolling cache is read once, so on Gemini its create +
+        # storage cost more than they save); this covers the path when it is enabled.
+        from hindsight_api.config import get_config
+
+        real = get_config()
+
+        class _CacheEnabled:
+            reflect_prompt_cache_enabled = True
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        monkeypatch.setattr("hindsight_api.engine.reflect.agent.get_config", _CacheEnabled)
         functions = {
             "search_observations_fn": AsyncMock(return_value={"observations": [{"id": "obs-1"}]}),
             "recall_fn": AsyncMock(return_value={"memories": [{"id": "mem-1", "content": "x"}]}),
@@ -2132,3 +2145,58 @@ class TestReflectIncrementalCache:
         assert len(provider.deleted_sessions) == 1
         assert provider.deleted_sessions[0].startswith("reflect:")
         assert provider.deleted_sessions[0] == provider.created[0][0]
+
+
+class TestReflectShortIdAliases:
+    """The model reads short aliases (presentation.py); what it cites must come back as real ids."""
+
+    @pytest.mark.asyncio
+    async def test_done_citations_written_as_aliases_resolve_to_real_ids(self):
+        functions = {
+            "search_observations_fn": AsyncMock(
+                return_value={"observations": [{"id": "obs-uuid-1", "text": "an observation"}]}
+            ),
+            "recall_fn": AsyncMock(return_value={"memories": [{"id": "mem-uuid-1", "text": "a fact"}]}),
+            "search_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
+            "expand_fn": AsyncMock(return_value={"memories": []}),
+        }
+
+        def _tc(cid, name):
+            return LLMToolCallResult(
+                tool_calls=[LLMToolCall(id=cid, name=name, arguments={"query": "q"})], finish_reason="tool_calls"
+            )
+
+        provider = _StepCacheProvider(
+            scripted=[
+                _tc("0", "search_observations"),
+                _tc("1", "recall"),
+                LLMToolCallResult(
+                    tool_calls=[
+                        LLMToolCall(
+                            id="2",
+                            name="done",
+                            arguments={"answer": "A", "memory_ids": ["f1"], "observation_ids": ["o1"]},
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                ),
+            ]
+        )
+
+        result = await run_reflect_agent(
+            llm_config=provider,
+            bank_id="alias-bank",
+            query="q",
+            bank_profile={"name": "T", "mission": "M"},
+            has_mental_models=False,
+            include_observations=True,
+            include_recall=True,
+            budget="high",
+            max_iterations=8,
+            **functions,
+        )
+
+        assert result.used_memory_ids == ["mem-uuid-1"]
+        assert result.used_observation_ids == ["obs-uuid-1"]
+        # The raw record stays in the trace; only the prompt carried the alias.
+        assert result.tool_trace[1].output["memories"][0]["id"] == "mem-uuid-1"

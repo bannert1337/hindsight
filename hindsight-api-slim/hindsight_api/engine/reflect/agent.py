@@ -28,6 +28,7 @@ from .models import (
     TokenUsageSummary,
     ToolCall,
 )
+from .presentation import ToolResultPresenter
 from .prompts import (
     _SPLIT_SYNTHESIS_WARN_CHUNKS,
     CLAIMS_SYSTEM_PROMPT,
@@ -671,6 +672,9 @@ async def _run_reflect_agent_inner(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": build_agent_user_prompt(query, llm_output_language)},
     ]
+    # What the model reads of each tool result, and the alias table that maps the
+    # short ids it writes back to real ones — see presentation.py.
+    presenter = ToolResultPresenter()
 
     # Step-by-step context caching for the agentic tool loop.
     #
@@ -679,8 +683,10 @@ async def _run_reflect_agent_inner(
     # Instead we roll a cache forward one step at a time — after each turn the
     # cache is extended to cover that turn's FULL input, so the next ``auto`` turn
     # reuses the entire prior conversation at the cached rate and sends only its
-    # own new tool results as the delta. Each new tool payload is therefore billed
-    # at full price exactly once (the turn it's produced), then cached thereafter.
+    # own new tool results as the delta. Note what this costs on Gemini: a cache
+    # CREATE is billed at the full input rate plus storage, and each rolling cache is
+    # read once, so the whole prior conversation is paid in full at every step anyway.
+    # That is why HINDSIGHT_API_REFLECT_PROMPT_CACHE_ENABLED defaults to off.
     #
     # The cache create for turn N+1 covers turn N's input, which is fully known the
     # moment turn N's LLM call returns — so we kick it off as a background task that
@@ -1198,7 +1204,7 @@ async def _run_reflect_agent_inner(
                 span.set_attribute("hindsight.scope", "reflect_tool_call")
                 span.set_attribute("hindsight.operation", "reflect_tool_call")
                 return await _process_done_tool(
-                    done_call,
+                    done_call.model_copy(update={"arguments": presenter.resolve(done_call.arguments)}),
                     available_memory_ids,
                     available_mental_model_ids,
                     available_observation_ids,
@@ -1294,7 +1300,7 @@ async def _run_reflect_agent_inner(
             # Execute tools in parallel
             tool_tasks = [
                 _execute_tool_with_timing(
-                    tc,
+                    tc.model_copy(update={"arguments": presenter.resolve(tc.arguments)}),
                     search_mental_models_fn,
                     search_observations_fn,
                     recall_fn,
@@ -1380,8 +1386,11 @@ async def _run_reflect_agent_inner(
                         if "id" in memory:
                             available_memory_ids.add(memory["id"])
 
-                # Record the serialized result; emitted in original order below.
-                tool_outputs[position] = json.dumps(output, default=str, ensure_ascii=False)
+                # Record the serialized result; emitted in original order below. The
+                # model reads the presented form (see presentation.py); the trace
+                # below keeps the raw output.
+                presented = presenter.present(output)
+                tool_outputs[position] = json.dumps(presented, default=str, ensure_ascii=False)
 
                 # Track for logging and context history
                 input_dict = {"tool": tc.name, **tc.arguments}
@@ -1416,7 +1425,7 @@ async def _run_reflect_agent_inner(
                 )
 
                 # Keep context history for fallback final prompt
-                context_history.append({"tool": tc.name, "input": input_dict, "output": output})
+                context_history.append({"tool": tc.name, "input": input_dict, "output": presented})
 
             # Emit tool_result messages in the assistant tool_calls order so the
             # serialized history matches the tool_use blocks (Anthropic requires
